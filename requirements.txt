@@ -1,0 +1,7 @@
+# mcp 2.x drops the mcp.server.fastmcp module this server is built on, so an
+# unpinned install breaks the deployment on the next rebuild.
+mcp>=1.9.0,<2.0.0
+httpx>=0.24.0
+python-dotenv>=1.0.0
+uvicorn>=0.30.0
+xmltodict>=0.13.0
