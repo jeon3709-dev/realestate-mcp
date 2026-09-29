@@ -4,7 +4,7 @@ from importlib import import_module
 from mcp.server.fastmcp import FastMCP
 
 # 등록 순서 = 도구 목록 순서
-TOOL_MODULES: tuple[str, ...] = ()
+TOOL_MODULES: tuple[str, ...] = ("vworld", "bldrgst", "rtms")
 
 
 def register_all(mcp: FastMCP) -> None:

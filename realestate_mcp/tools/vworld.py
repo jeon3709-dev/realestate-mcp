@@ -1,0 +1,671 @@
+"""VWorld Open API 도구 (원본: jeon3709-dev/vworld-mcp server.py).
+
+원본 로직·파라미터·반환 형식을 그대로 옮겼다. 변경점:
+- 키/도메인/HTTP 클라이언트/마스킹은 config·common 공용 함수를 사용
+- 요청은 get_with_retry(5xx·네트워크 오류 1회 재시도)로 보냄
+- vworld_health_check 는 통합 health_check 의 내부 함수 _vworld_health 로 이동
+- 신규 내부 함수 vworld_find_parcel_by_point: 좌표 → 필지(PNU) (site_profile 주소 입력용)
+"""
+import asyncio
+import datetime
+import logging
+import time
+from typing import Any, Dict, List, Literal, Optional
+
+import httpx
+from mcp.server.fastmcp import FastMCP
+
+from .. import config
+from ..common import get_with_retry, make_client, sanitize_error
+
+logger = logging.getLogger("vworld-mcp")
+
+# VWorld Endpoints
+SEARCH_API_URL = "https://api.vworld.kr/req/search"
+ADDRESS_API_URL = "https://api.vworld.kr/req/address"
+DATA_API_URL = "https://api.vworld.kr/req/data"
+WFS_API_URL = "https://api.vworld.kr/req/wfs"
+NED_CHARACTERISTICS_URL = "https://api.vworld.kr/ned/data/getLandCharacteristics"
+
+PARCEL_LAYER = "LP_PA_CBND_BUBUN"
+
+
+def get_api_key() -> str:
+    """Helper to retrieve VWorld API key and raise a user-friendly error if missing."""
+    return config.get_vworld_api_key()
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """Return an httpx AsyncClient with optional proxy configuration."""
+    return make_client("vworld")
+
+
+def parse_error_response(response_json: Dict[str, Any]) -> str:
+    """Extract error messages from VWorld standard response format."""
+    try:
+        res = response_json.get("response", {})
+        if res.get("status") == "ERROR":
+            error_info = res.get("error", {})
+            error_code = error_info.get("code", "UNKNOWN")
+            error_text = error_info.get("text", "No error description provided.")
+            return f"VWorld Error [{error_code}]: {error_text}"
+    except Exception:
+        pass
+    return "Unknown VWorld API Error"
+
+
+def calculate_centroid(geojson_geom: Dict[str, Any]) -> tuple[float, float]:
+    """
+    Calculate a simple centroid (mean coordinate) of a GeoJSON geometry.
+    This avoids external dependencies like shapely for lightweight execution.
+    """
+    coords = geojson_geom.get("coordinates", [])
+
+    if not coords:
+        raise ValueError("Geometry coordinates are empty.")
+
+    def flat_coords(lst: Any) -> Any:
+        # Recursively flatten coordinate array to find all [lon, lat] pairs
+        if isinstance(lst, list) and len(lst) == 2 and not isinstance(lst[0], list):
+            yield lst
+        elif isinstance(lst, list):
+            for sub in lst:
+                yield from flat_coords(sub)
+
+    points = list(flat_coords(coords))
+    if not points:
+        raise ValueError("No valid coordinates found in geometry structure.")
+
+    sum_lon = sum(pt[0] for pt in points)
+    sum_lat = sum(pt[1] for pt in points)
+    n = len(points)
+    return sum_lat / n, sum_lon / n
+
+
+async def vworld_search(query: str, category: Literal["address", "place"] = "address") -> Dict[str, Any]:
+    """
+    Search for addresses or places using VWorld Search API (service=search).
+    Returns matched results along with their coordinates (latitude, longitude).
+    """
+    api_key = get_api_key()
+    domain = config.vworld_domain()
+
+    async def fetch_search(vworld_type: str, vworld_category: Optional[str] = None) -> List[Dict[str, Any]] | Dict[str, Any]:
+        params = {
+            "key": api_key,
+            "service": "search",
+            "request": "search",
+            "version": "2.0",
+            "query": query,
+            "type": vworld_type,
+            "format": "json",
+            "errorFormat": "json",
+            "domain": domain,
+            "size": "10"
+        }
+        if vworld_category:
+            params["category"] = vworld_category
+
+        async with get_http_client() as client:
+            try:
+                response = await get_with_retry(client, SEARCH_API_URL, params=params)
+                response.raise_for_status()
+                data = response.json()
+            except Exception as e:
+                logger.error(f"Search API request failed: {sanitize_error(str(e))}")
+                return {"status": "NETWORK_ERROR", "message": f"Network request failed: {sanitize_error(str(e))}"}
+
+        res_envelope = data.get("response", {})
+        status = res_envelope.get("status", "ERROR")
+        if status != "OK":
+            return []
+
+        items = res_envelope.get("result", {}).get("items", [])
+        results = []
+        for item in items:
+            point = item.get("point", {})
+            lon = float(point.get("x")) if point.get("x") else None
+            lat = float(point.get("y")) if point.get("y") else None
+            results.append({
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "address": item.get("address", {}).get("road") or item.get("address", {}).get("parcel"),
+                "category": item.get("category"),
+                "coordinates": {"lat": lat, "lon": lon} if lat and lon else None
+            })
+        return results
+
+    if category == "address":
+        # Query both road and parcel concurrently to provide a comprehensive address search.
+        road_results, parcel_results = await asyncio.gather(
+            fetch_search("ADDRESS", "road"),
+            fetch_search("ADDRESS", "parcel")
+        )
+
+        # fetch_search returns a list of results, or an error dict on network failure.
+        if isinstance(road_results, dict):
+            return road_results
+        if isinstance(parcel_results, dict):
+            return parcel_results
+
+        merged = road_results + parcel_results
+
+        # Remove duplicates
+        seen = set()
+        unique_results = []
+        for r in merged:
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                unique_results.append(r)
+
+        if not unique_results:
+            return {"status": "NOT_FOUND", "message": "No search results found.", "results": []}
+        return {"status": "OK", "results": unique_results}
+    else:  # place
+        results = await fetch_search("PLACE", None)
+        if isinstance(results, dict):
+            return results
+        if not results:
+            return {"status": "NOT_FOUND", "message": "No search results found.", "results": []}
+        return {"status": "OK", "results": results}
+
+
+async def vworld_geocode(address: str, address_type: Literal["road", "parcel"] = "road") -> Dict[str, Any]:
+    """
+    Convert a street (road) or parcel (parcel) address to coordinates using VWorld Geocoder API.
+
+    IMPORTANT POLICY CONSTRAINT:
+    - Daily limit of 30,000 requests.
+    - DO NOT cache or store these coordinates in any local or remote database/storage.
+      Real-time queries only.
+    """
+    api_key = get_api_key()
+
+    vworld_type = "ROAD" if address_type == "road" else "PARCEL"
+
+    params = {
+        "key": api_key,
+        "service": "address",
+        "request": "getcoord",
+        "version": "2.0",
+        "crs": "epsg:4326",
+        "address": address,
+        "type": vworld_type,
+        "format": "json",
+        "errorFormat": "json",
+        "domain": config.vworld_domain()
+    }
+
+    async with get_http_client() as client:
+        response = None
+        try:
+            response = await get_with_retry(client, ADDRESS_API_URL, params=params)
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPError as e:
+            return {"status": "NETWORK_ERROR", "message": f"Network request failed: {sanitize_error(str(e))}"}
+        except ValueError:
+            body = response.text if response is not None else ""
+            return {"status": "ERROR", "message": f"Failed to parse JSON response: {sanitize_error(body)}"}
+
+    res_envelope = data.get("response", {})
+    status = res_envelope.get("status", "ERROR")
+
+    if status == "ERROR":
+        return {"status": "ERROR", "message": parse_error_response(data)}
+
+    if status == "NOT_FOUND":
+        return {"status": "NOT_FOUND", "message": "Address not found."}
+
+    point = res_envelope.get("result", {}).get("point", {})
+    lon = float(point.get("x")) if point.get("x") else None
+    lat = float(point.get("y")) if point.get("y") else None
+
+    # Explicit policy warning in response metadata
+    return {
+        "status": "OK",
+        "coordinates": {"lat": lat, "lon": lon},
+        "address": res_envelope.get("refined", {}).get("text", address),
+        "_policy_notice": "CAUTION: Storing or caching coordinates retrieved from VWorld is strictly prohibited."
+    }
+
+
+async def vworld_reverse_geocode(lat: float, lon: float) -> Dict[str, Any]:
+    """
+    Convert coordinates (latitude, longitude) to an address using VWorld Geocoder API.
+
+    IMPORTANT POLICY CONSTRAINT:
+    - Daily limit of 30,000 requests.
+    - DO NOT cache or store these address attributes in any local or remote database/storage.
+      Real-time queries only.
+    """
+    api_key = get_api_key()
+
+    params = {
+        "key": api_key,
+        "service": "address",
+        "request": "getAddress",
+        "version": "2.0",
+        "point": f"{lon},{lat}",
+        "type": "both",  # Returns both road name and parcel address
+        "format": "json",
+        "errorFormat": "json",
+        "domain": config.vworld_domain()
+    }
+
+    async with get_http_client() as client:
+        response = None
+        try:
+            response = await get_with_retry(client, ADDRESS_API_URL, params=params)
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPError as e:
+            return {"status": "NETWORK_ERROR", "message": f"Network request failed: {sanitize_error(str(e))}"}
+        except ValueError:
+            body = response.text if response is not None else ""
+            return {"status": "ERROR", "message": f"Failed to parse JSON response: {sanitize_error(body)}"}
+
+    res_envelope = data.get("response", {})
+    status = res_envelope.get("status", "ERROR")
+
+    if status == "ERROR":
+        return {"status": "ERROR", "message": parse_error_response(data)}
+
+    if status == "NOT_FOUND":
+        return {"status": "NOT_FOUND", "message": "Address not found at this location."}
+
+    results = res_envelope.get("result", [])
+    addresses = []
+    for item in results:
+        addresses.append({
+            "type": item.get("type"),  # parcel or road
+            "text": item.get("text"),
+            "structure": item.get("structure", {})
+        })
+
+    return {
+        "status": "OK",
+        "addresses": addresses,
+        "_policy_notice": "CAUTION: Storing or caching addresses retrieved from VWorld is strictly prohibited."
+    }
+
+
+async def _query_parcel_layer(filter_params: Dict[str, str], not_found_message: str) -> Dict[str, Any]:
+    """Shared GetFeature call on LP_PA_CBND_BUBUN (original vworld_get_parcel body)."""
+    api_key = get_api_key()
+
+    params = {
+        "key": api_key,
+        "service": "data",
+        "request": "GetFeature",
+        "data": PARCEL_LAYER,
+        **filter_params,
+        "crs": "EPSG:4326",
+        "format": "json",
+        "domain": config.vworld_domain()
+    }
+
+    async with get_http_client() as client:
+        response = None
+        try:
+            response = await get_with_retry(client, DATA_API_URL, params=params)
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPError as e:
+            return {"status": "NETWORK_ERROR", "message": f"Network request failed: {sanitize_error(str(e))}"}
+        except ValueError:
+            body = response.text if response is not None else ""
+            return {"status": "ERROR", "message": f"Failed to parse JSON response: {sanitize_error(body)}"}
+
+    res_envelope = data.get("response", {})
+    status = res_envelope.get("status", "ERROR")
+
+    if status == "ERROR":
+        return {"status": "ERROR", "message": parse_error_response(data)}
+
+    if status == "NOT_FOUND":
+        return {"status": "NOT_FOUND", "message": not_found_message}
+
+    result = res_envelope.get("result", {})
+    feature_collection = result.get("featureCollection", {})
+    features = feature_collection.get("features", [])
+
+    if not features:
+        return {"status": "NOT_FOUND", "message": "No features found in VWorld response."}
+
+    # Extract the first matching feature
+    feature = features[0]
+    return {
+        "status": "OK",
+        "properties": feature.get("properties", {}),
+        "geometry": feature.get("geometry", {})
+    }
+
+
+async def vworld_get_parcel(pnu: str) -> Dict[str, Any]:
+    """
+    Get parcel boundary (GeoJSON) and attributes from VWorld Data API (LP_PA_CBND_BUBUN layer).
+    pnu: 19-digit unique parcel identification number.
+    """
+    get_api_key()
+
+    if len(pnu) != 19:
+        return {"status": "ERROR", "message": "PNU must be exactly 19 digits."}
+
+    res = await _query_parcel_layer(
+        {"attrFilter": f"pnu:=:{pnu}"},
+        "No parcel boundary found for the provided PNU."
+    )
+    if res.get("status") != "OK":
+        return res
+
+    return {
+        "status": "OK",
+        "pnu": pnu,
+        "properties": res["properties"],
+        "geometry": res["geometry"]
+    }
+
+
+async def vworld_find_parcel_by_point(lat: float, lon: float) -> Dict[str, Any]:
+    """
+    (internal) Find the parcel containing a coordinate on LP_PA_CBND_BUBUN and return its PNU.
+
+    NOTE: `geomFilter=POINT(x y)` 는 원본 vworld-mcp 에 없던 파라미터다. 공식 문서(vworld.kr)는
+    이 환경에서 접근이 차단되어 직접 확인하지 못했고, 타 저장소의 실사용 코드로만 확인했다.
+    속성명 `pnu` 는 원본의 attrFilter(pnu:=:...) 사용으로 존재가 확인된다.
+    """
+    res = await _query_parcel_layer(
+        {"geomFilter": f"POINT({lon} {lat})"},
+        "No parcel found at the provided coordinates."
+    )
+    if res.get("status") != "OK":
+        return res
+
+    properties = res["properties"]
+    pnu = properties.get("pnu") or properties.get("PNU")
+    if not pnu:
+        return {"status": "NOT_FOUND", "message": "Parcel feature has no 'pnu' attribute."}
+    return {
+        "status": "OK",
+        "pnu": str(pnu),
+        "properties": properties,
+        "geometry": res["geometry"]
+    }
+
+
+async def vworld_get_landuse_zone(
+    pnu: Optional[str] = None,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None
+) -> Dict[str, Any]:
+    """
+    Get land use zoning information (LT_C_UQ111 ~ LT_C_UQ114 layers) using VWorld WFS API.
+
+    You must provide either 'pnu' OR both ('lat' and 'lon').
+    - If PNU is provided, it automatically fetches the parcel boundary geometry to calculate the center coordinate.
+    - Then, it queries WFS layers using a BBOX spatial filter (10m x 10m area centered at the coordinate).
+    """
+    api_key = get_api_key()
+    domain = config.vworld_domain()
+
+    if pnu:
+        # Step 1: Query parcel boundary to calculate centroid
+        parcel_res = await vworld_get_parcel(pnu)
+        if parcel_res.get("status") != "OK":
+            return {"status": "ERROR", "message": f"Could not find coordinates for PNU: {parcel_res.get('message')}"}
+
+        geom = parcel_res.get("geometry") or {}
+        try:
+            query_lat, query_lon = calculate_centroid(geom)
+            logger.info(f"Calculated centroid for PNU {pnu}: lat={query_lat}, lon={query_lon}")
+        except Exception as e:
+            return {"status": "ERROR", "message": f"Centroid calculation failed: {sanitize_error(str(e))}"}
+    elif lat is not None and lon is not None:
+        query_lat, query_lon = lat, lon
+    else:
+        return {"status": "ERROR", "message": "Either 'pnu' or both 'lat' and 'lon' must be provided."}
+
+    # WFS Layers representing 4 main land use classification types in Korea
+    # lt_c_uq111: Urban Area (도시지역)
+    # lt_c_uq112: Management Area (관리지역)
+    # lt_c_uq113: Agricultural Area (농림지역)
+    # lt_c_uq114: Natural Environment Preservation Area (자연환경보전지역)
+    layers = {
+        "lt_c_uq111": "도시지역 (Urban Area)",
+        "lt_c_uq112": "관리지역 (Management Area)",
+        "lt_c_uq113": "농림지역 (Agricultural Area)",
+        "lt_c_uq114": "자연환경보전지역 (Natural Environment Preservation Area)"
+    }
+
+    zoning_results = []
+
+    # Calculate a small 10m x 10m bounding box around the coordinate.
+    # 0.00005 degrees of latitude/longitude is roughly 5 meters, creating a 10m span.
+    delta = 0.00005
+    min_lon = query_lon - delta
+    max_lon = query_lon + delta
+    min_lat = query_lat - delta
+    max_lat = query_lat + delta
+    bbox_str = f"{min_lon},{min_lat},{max_lon},{max_lat}"
+
+    async def fetch_layer_zoning(layer_id: str, layer_name: str) -> List[Dict[str, Any]] | Dict[str, Any]:
+        params = {
+            "SERVICE": "WFS",
+            "REQUEST": "GetFeature",
+            "VERSION": "1.1.0",
+            "TYPENAME": layer_id,
+            "OUTPUT": "application/json",
+            "SRSNAME": "EPSG:4326",
+            "KEY": api_key,
+            "DOMAIN": domain,
+            "BBOX": bbox_str
+        }
+
+        async with get_http_client() as client:
+            try:
+                response = await get_with_retry(client, WFS_API_URL, params=params)
+                response.raise_for_status()
+
+                # Check for XML exceptions returned as text
+                if "ExceptionReport" in response.text:
+                    logger.error(f"WFS Server Exception for layer {layer_id}: {sanitize_error(response.text)}")
+                    return []
+
+                data = response.json()
+                features = data.get("features", [])
+                results = []
+                for feature in features:
+                    properties = feature.get("properties", {})
+                    ucode = properties.get("ucode") or properties.get("UCODE")
+                    uname = properties.get("uname") or properties.get("UNAME")
+                    results.append({
+                        "layer_id": layer_id,
+                        "layer_type": layer_name,
+                        "code": ucode,
+                        "name": uname,
+                        "properties": properties
+                    })
+                return results
+            except Exception as e:
+                logger.error(f"Error fetching zoning layer {layer_id}: {sanitize_error(str(e))}")
+                return {"status": "NETWORK_ERROR", "message": f"Network request failed for layer {layer_id}: {sanitize_error(str(e))}"}
+
+    # Query all 4 zoning layers concurrently
+    tasks = [fetch_layer_zoning(lid, lname) for lid, lname in layers.items()]
+    all_results = await asyncio.gather(*tasks)
+
+    for rlist in all_results:
+        # fetch_layer_zoning returns a list of features, or an error dict on failure.
+        if isinstance(rlist, dict):
+            return rlist
+        zoning_results.extend(rlist)
+
+    return {
+        "status": "OK",
+        "queried_coordinates": {"lat": query_lat, "lon": query_lon},
+        "zoning_info": zoning_results
+    }
+
+
+async def vworld_get_individual_price(pnu: str) -> Dict[str, Any]:
+    """
+    Query individual land public price (개별공시지가) from VWorld Land Characteristics API.
+    pnu: 19-digit parcel identifier.
+
+    It queries the current year and dynamically falls back up to 3 years back (e.g. 2026 -> 2025 -> 2024)
+    if no data is found for the primary year.
+    """
+    api_key = get_api_key()
+    domain = config.vworld_domain()
+
+    if len(pnu) != 19:
+        return {"status": "ERROR", "message": "PNU must be exactly 19 digits."}
+
+    # Generate descending list of years to try fallback (current year and past 3 years)
+    current_year = datetime.datetime.now().year
+    years_to_try = [str(current_year - i) for i in range(4)]  # e.g. [2026, 2025, 2024, 2023]
+
+    async with get_http_client() as client:
+        for year in years_to_try:
+            params = {
+                "key": api_key,
+                "pnu": pnu,
+                "stdrYear": year,
+                "format": "json",
+                "domain": domain
+            }
+
+            try:
+                response = await get_with_retry(client, NED_CHARACTERISTICS_URL, params=params)
+                response.raise_for_status()
+
+                # Check if JSON returned
+                data = response.json()
+
+                # VWorld ned characteristics response structures:
+                # Success usually contains {"landCharacteristicss": {"field": [...]}} (Note the double 's')
+                # Fallback to standard "landCharacteristics" in case VWorld fixes the spelling error.
+                land_char = data.get("landCharacteristicss", {}) or data.get("landCharacteristics", {})
+                fields = land_char.get("field", [])
+
+                if fields:
+                    field = fields[0]
+                    price_str = field.get("pblntfPclnd")  # 공시지가 (원/m2)
+
+                    if price_str:
+                        try:
+                            price = int(price_str)
+                        except ValueError:
+                            price = price_str
+
+                        return {
+                            "status": "OK",
+                            "pnu": pnu,
+                            "year": year,
+                            "individual_public_price": price,  # Won per m2
+                            "unit": "KRW/㎡",
+                            "land_area": field.get("lndpclAr"),  # 토지면적
+                            "ji_mok": field.get("lndcgrCodeNm"),  # 지목명
+                            "land_use_status": field.get("ladUseSittnNm"),  # 토지이용상황
+                            "properties": field
+                        }
+            except httpx.HTTPError as e:
+                logger.error(f"HTTP error querying price for year {year}: {sanitize_error(str(e))}")
+                return {"status": "NETWORK_ERROR", "message": f"Network request failed: {sanitize_error(str(e))}"}
+            except ValueError:
+                # May have received XML or non-JSON (like VWorld system error)
+                logger.error(f"Non-JSON response received from Land Characteristics for year {year}")
+
+    return {
+        "status": "NOT_FOUND",
+        "message": f"Individual land price not found for PNU {pnu} in years {', '.join(years_to_try)}."
+    }
+
+
+async def _vworld_health() -> Dict[str, Any]:
+    """
+    (internal, was `vworld_health_check`)
+    Diagnostic to check VWorld API connectivity and potential IP blocks (e.g. 502 Bad Gateway).
+    It sends a lightweight request to the VWorld Search API. No retry (measures raw latency).
+    """
+    try:
+        api_key = get_api_key()
+    except ValueError as e:
+        return {"status": "ERROR", "message": f"Configuration error: {sanitize_error(str(e))}"}
+
+    params = {
+        "key": api_key,
+        "service": "search",
+        "request": "search",
+        "version": "2.0",
+        "query": "서울",
+        "type": "ADDRESS",
+        "format": "json",
+        "errorFormat": "json",
+        "domain": config.vworld_domain(),
+        "size": "1"
+    }
+
+    start_time = time.time()
+
+    async with get_http_client() as client:
+        try:
+            response = await client.get(SEARCH_API_URL, params=params)
+            elapsed = round(time.time() - start_time, 3)
+
+            status_code = response.status_code
+
+            data: Any
+            try:
+                data = response.json()
+            except ValueError:
+                data = sanitize_error(response.text[:200])
+
+            # 통합 health_check 에서는 HTTP 200 이더라도 VWorld 응답 본문의 status 가
+            # ERROR(예: 인증키 오류)이면 ERROR 로 보고한다.
+            api_status = None
+            if isinstance(data, dict):
+                api_status = data.get("response", {}).get("status")
+                if api_status == "ERROR":
+                    return {
+                        "status": "ERROR",
+                        "http_status_code": status_code,
+                        "elapsed_seconds": elapsed,
+                        "api_response_status": api_status,
+                        "response_preview": data,
+                        "message": parse_error_response(data)
+                    }
+
+            return {
+                "status": "OK" if status_code == 200 else "NETWORK_ERROR",
+                "http_status_code": status_code,
+                "elapsed_seconds": elapsed,
+                "api_response_status": api_status,
+                "response_preview": data,
+                "message": "Connection successful." if status_code == 200 else f"Blocked or failed with HTTP {status_code}"
+            }
+
+        except Exception as e:
+            elapsed = round(time.time() - start_time, 3)
+            return {
+                "status": "NETWORK_ERROR",
+                "http_status_code": None,
+                "elapsed_seconds": elapsed,
+                "message": f"Network request failed completely: {sanitize_error(str(e))}"
+            }
+
+
+TOOLS = (
+    vworld_search,
+    vworld_geocode,
+    vworld_reverse_geocode,
+    vworld_get_parcel,
+    vworld_get_landuse_zone,
+    vworld_get_individual_price,
+)
+
+
+def register(mcp: FastMCP) -> None:
+    for fn in TOOLS:
+        mcp.tool()(fn)
