@@ -42,7 +42,10 @@ def _mock_world(router: respx.MockRouter, *, building_status: int = 200, stats: 
 
     def wfs(request: httpx.Request) -> httpx.Response:
         if request.url.params["TYPENAME"] == "lt_c_uq111":
-            return httpx.Response(200, json=fx.wfs_features([{"uname": "일반상업지역", "ucode": "UQA220"}]))
+            return httpx.Response(200, json=fx.wfs_features([
+                {"uname": None, "ucode": "UQA01X"},  # 실응답에서 uname 이 null 인 도시지역 피처가 함께 옴
+                {"uname": "일반상업지역", "ucode": "UQA220"},
+            ]))
         return httpx.Response(200, json=fx.wfs_features([]))
 
     def br(request: httpx.Request) -> httpx.Response:
@@ -119,7 +122,9 @@ async def test_site_profile_by_pnu_ok(fake_keys):
     assert "### 📊 거래 분석 요약 (토지)" in md
     assert md.rstrip().endswith("공공 API 원자료 기준이며 등기부·현장 확인이 필요함")
 
+    assert res["sections"]["parcel"]["data"]["cadastral_addr"] == "서울특별시 강남구 역삼동 822-2"
     src = res["sources"]
+    assert src["parcel"]["reference_year_month"] == "2025-01"
     assert src["land_price"]["reference_year"] == res["sections"]["land_price"]["data"]["year"]
     months = rtms.get_months_list(12)
     assert src["transactions"]["deal_ymd_range"] == f"{months[-1]}~{months[0]}"

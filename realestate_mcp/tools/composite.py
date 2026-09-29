@@ -208,11 +208,15 @@ def _build_parcel_section(pnu: str, parcel_bundle: Dict[str, Any], bdong: Option
     reverse = parcel_bundle.get("reverse") or {}
     parts = split_pnu(pnu)
 
+    props = parcel.get("properties") or {}
     jibun_address = None
     if bdong:
         jibun_address = " ".join(
             p for p in (bdong.get("sido"), bdong.get("sigungu"), bdong.get("dong"), bdong.get("ri"), parts.jibun) if p
         )
+    elif props.get("addr"):
+        # 법정동코드 DB 에 없을 때만 연속지적도 속성 addr 사용 (실응답으로 확인된 필드)
+        jibun_address = props.get("addr")
 
     road_address = None
     parcel_address_vworld = None
@@ -239,6 +243,11 @@ def _build_parcel_section(pnu: str, parcel_bundle: Dict[str, Any], bdong: Option
             "jibun_address": jibun_address,
             "road_address": road_address,
             "parcel_address_vworld": parcel_address_vworld,
+            "cadastral_addr": props.get("addr"),
+            "cadastral_gosi_year_month": (
+                f"{props.get('gosi_year')}-{props.get('gosi_month')}"
+                if props.get("gosi_year") and props.get("gosi_month") else None
+            ),
             "centroid": parcel_bundle.get("centroid"),
             "properties": parcel.get("properties") if status == "OK" else None,
         },
@@ -493,7 +502,8 @@ def _render_markdown(result: Dict[str, Any], indicators: Dict[str, Any]) -> str:
         md += "\n" + "\n".join(blocks)
 
     if parcel.get("legal_dong") and parcel["legal_dong"].get("ri"):
-        md += "\n> ℹ️ 리(里) 단위 필지: 실거래가 법정동 필터는 읍·면 명칭 기준으로 적용됨\n"
+        md += ("\n> ⚠️ 리(里) 단위 필지: 실거래가 법정동 필터를 읍·면 명칭으로 적용함. 읍·면 지역의 실거래 응답 "
+               "umdNm 형식이 확인되지 않아 거래가 누락될 수 있음(0건이면 rtms_* 도구로 시군구 전체 조회 권장)\n")
     md += f"\n> ⚠️ {DISCLAIMER}\n"
     return md
 
@@ -669,7 +679,8 @@ async def site_profile(
         "parcel": {
             "apis": ["VWorld 2D 데이터 API (LP_PA_CBND_BUBUN 연속지적도)", "VWorld Geocoder API (getAddress 역지오코딩)",
                      "법정동코드 DB (data/code_bdong.json)"],
-            "reference_date": None,  # TODO: 연속지적도 기준일자 필드명 미확인
+            # 연속지적도 속성 gosi_year / gosi_month 원문값 (고시 연·월). 없으면 null
+            "reference_year_month": parcel_data.get("cadastral_gosi_year_month"),
             "queried_at": queried_at,
         },
         "landuse": {

@@ -28,7 +28,12 @@ def vworld_parcel(pnu: str = PNU) -> Dict[str, Any]:
                     "features": [{
                         "type": "Feature",
                         "geometry": PARCEL_GEOMETRY,
-                        "properties": {"pnu": pnu},
+                        # 속성 키 구성은 기존 VWorld 커넥터 실응답(2026-09-29)과 동일, 값은 합성
+                        "properties": {
+                            "pnu": pnu, "jibun": "822-2 대", "bonbun": "822", "bubun": "2",
+                            "addr": "서울특별시 강남구 역삼동 822-2", "gosi_year": "2025", "gosi_month": "01",
+                            "jiga": "1000",
+                        },
                     }],
                 }
             },
