@@ -7,6 +7,7 @@
   단위 환산(㎡→평 = ×0.3025, 원/㎡→원/평 = ÷0.3025)만 수행한다(원본 calc_price_per_pyung 과 동일 계수).
 """
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -726,7 +727,12 @@ async def health_check() -> Dict[str, Any]:
         _safe(bldrgst._bldrgst_health()),
         _safe(rtms._rtms_health()),
     )
-    apis = {"vworld": vw, "bldrgst": br, "rtms": rt}
+    apis: Dict[str, Any] = {"vworld": vw, "bldrgst": br, "rtms": rt}
+    # 응답 프리뷰까지 포함해 키가 새지 않도록 전체를 한 번 더 마스킹한다.
+    try:
+        apis = json.loads(sanitize_error(json.dumps(apis, ensure_ascii=False, default=str)))
+    except ValueError:
+        pass
     oks = [r.get("status") == "OK" for r in apis.values()]
     if all(oks):
         status = "OK"
