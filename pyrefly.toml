@@ -1,0 +1,17 @@
+# Pyrefly configuration.
+# Only analyze this project's own source files (not .venv / virtual buffers).
+project-includes = [
+    "server.py",
+    "realestate_mcp/**/*.py",
+    "scripts/**/*.py",
+    "tests/**/*.py",
+]
+
+project-excludes = [
+    "**/.venv/**",
+    "**/venv/**",
+    "**/__pycache__/**",
+    "**/_pyrefly_virtual_/**",
+]
+
+search-path = ["."]
