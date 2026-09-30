@@ -601,6 +601,9 @@ async def _vworld_health() -> Dict[str, Any]:
         "version": "2.0",
         "query": "서울",
         "type": "ADDRESS",
+        # type=ADDRESS 는 category(road/parcel)가 필수 (누락 시 PARAM_REQUIRED).
+        # vworld_search 가 ADDRESS 검색에 쓰는 값과 동일하게 road 를 사용한다.
+        "category": "road",
         "format": "json",
         "errorFormat": "json",
         "domain": config.vworld_domain(),
