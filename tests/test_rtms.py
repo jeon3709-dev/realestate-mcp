@@ -222,3 +222,27 @@ async def test_all_months_empty_is_still_no_data(fake_keys):
     respx.get(LAND_URL).mock(return_value=httpx.Response(200, text=fx.rtms_xml([])))
     res = await rtms.rtms_search_land_transactions(pnu=fx.PNU, months_back=2)
     assert res["status"] == "NO_DATA"
+
+
+@respx.mock
+async def test_legacy_eup_myeon_matches_ri_umdnm(fake_keys):
+    """원본은 '양평읍' 정확 일치라 umdNm '양평읍 백안리' 를 모두 버렸다 → 읍면 접두 일치 허용."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["LAWD_CD"] == "41830"
+        return httpx.Response(200, text=fx.rtms_xml([
+            fx.land_item("양평읍 백안리", "2*", "12,000", "631", "2026", "9", "16"),
+            fx.land_item("양평읍 회현리", "1**", "462", "20", "2026", "9", "4"),
+            fx.land_item("양서면 복포리", "3**", "5,800", "182", "2026", "9", "23"),
+            fx.land_item("양평읍x", "9", "1", "1", "2026", "9", "1"),
+        ]))
+
+    respx.get(LAND_URL).mock(side_effect=handler)
+    res = await rtms.rtms_search_land_transactions("양평군", "양평읍", sido="경기도", months_back=1)
+    assert res["status"] == "OK"
+    assert sorted(t["address"] for t in res["transactions"]) == ["양평읍 백안리 2*", "양평읍 회현리 1**"]
+
+
+def test_legacy_city_dong_still_exact():
+    region, _ = rtms.resolve_region(None, "중구", "광희동", None, None)
+    assert region is not None
+    assert region.matches("광희동1가") and not region.matches("광희동") and not region.matches("을지로6가")

@@ -16,7 +16,7 @@ APT_URL = f"{rtms.BASE_URL}/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev"
 RECAP = {"platArea": "1000.5", "archArea": "550", "totArea": "12000", "bcRat": "55.2", "vlRat": "799.1",
          "mainPurpsCdNm": "업무시설", "mainBldCnt": "1", "totPkngCnt": "100"}
 TITLE = {"bldNm": "테스트빌딩", "dongNm": "", "grndFlrCnt": "20", "ugrndFlrCnt": "5", "mainPurpsCdNm": "업무시설",
-         "platArea": "1000.5", "totArea": "12000", "bcRat": "55.2", "vlRat": "799.1"}
+         "platArea": "1000.5", "totArea": "12000", "bcRat": "55.2", "vlRat": "799.1", "useAprDay": "19920117"}
 JIJIGU = [{"jijiguCdNm": "일반상업지역", "jijiguGbCdNm": "국토계획법", "reprYn": "1"},
           {"jijiguCdNm": "방화지구", "jijiguGbCdNm": "국토계획법", "reprYn": "0"}]
 
@@ -108,7 +108,7 @@ async def test_site_profile_by_pnu_ok(fake_keys):
     assert ind["ground_floors"] == 20 and ind["underground_floors"] == 5
     assert ind["building_count"] == 1
     assert ind["building_basis"] == "총괄표제부"
-    assert "use_approval_date" not in ind  # 미확인 필드는 요약에서 제외
+    assert ind["use_approval_date"] == "1992-01-17"
 
     land = ind["transactions"]["land"]
     assert land["valid_count"] == 2  # 삼성동 거래는 법정동 필터로 제외
@@ -254,3 +254,28 @@ async def test_vworld_health_param_error_reported(fake_keys):
     res = await vworld._vworld_health()
     assert res["status"] == "ERROR"
     assert res["message"].startswith("VWorld Error [PARAM_REQUIRED]")
+
+
+@respx.mock
+async def test_site_profile_ri_parcel_filters_by_eup_and_ri(fake_keys):
+    """리 단위 필지: umdNm 은 '양평읍 백안리' 형태 → 같은 리만 집계."""
+    ri_pnu = "4183025026100010000"  # 경기도 양평군 양평읍 백안리 1 (법정동코드는 code_bdong.json 기준)
+    months = rtms.get_months_list(1)
+    y, m = months[0][:4], months[0][4:]
+    _mock_world(respx.mock)
+    respx.get(vworld.DATA_API_URL).mock(return_value=httpx.Response(200, json=fx.vworld_parcel(ri_pnu)))
+
+    def land(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["LAWD_CD"] == "41830"
+        return httpx.Response(200, text=fx.rtms_xml([
+            fx.land_item("양평읍 백안리", "2*", "12,000", "631", y, m, "16"),
+            fx.land_item("양평읍 회현리", "1**", "462", "20", y, m, "4"),
+            fx.land_item("서종면 문호리", "4**", "23,639", "362", y, m, "29"),
+        ]))
+
+    respx.get(LAND_URL).mock(side_effect=land)
+    res = await composite.site_profile(pnu=ri_pnu, transaction_types=["land"], months_back=1, include_building=False)
+    tx = res["sections"]["transactions"]["data"]["land"]
+    assert tx["dong_filter"] == "양평읍 백안리"
+    assert [t["address"] for t in tx["recent_transactions"]] == ["양평읍 백안리 2*"]
+    assert res["address"]["jibun"] == "경기도 양평군 양평읍 백안리 1"
