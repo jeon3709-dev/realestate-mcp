@@ -224,3 +224,14 @@ async def test_health_check_without_keys():
 @pytest.mark.parametrize("value,expected", [("1,000.5", 1000.5), ("", None), (None, None), ("abc", None), (3, 3.0)])
 def test_to_float(value: Any, expected: Any):
     assert composite._to_float(value) == expected
+
+
+@respx.mock
+async def test_site_profile_rtms_blocked_is_error(fake_keys):
+    _mock_world(respx.mock)
+    respx.get(LAND_URL).mock(return_value=httpx.Response(403))
+    res = await composite.site_profile(pnu=fx.PNU, transaction_types=["land"])
+    tx = res["sections"]["transactions"]
+    assert tx["status"] == "ERROR"
+    assert tx["data"]["land"]["status"] == "ERROR"
+    assert res["status"] == "PARTIAL"
