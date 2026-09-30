@@ -235,3 +235,22 @@ async def test_site_profile_rtms_blocked_is_error(fake_keys):
     assert tx["status"] == "ERROR"
     assert tx["data"]["land"]["status"] == "ERROR"
     assert res["status"] == "PARTIAL"
+
+
+@respx.mock
+async def test_vworld_health_sends_required_category(fake_keys):
+    """type=ADDRESS search requires category (VWorld returns PARAM_REQUIRED otherwise)."""
+    route = respx.get(vworld.SEARCH_API_URL).mock(return_value=httpx.Response(200, json={"response": {"status": "OK"}}))
+    res = await vworld._vworld_health()
+    params = route.calls.last.request.url.params
+    assert params["type"] == "ADDRESS" and params["category"] == "road"
+    assert res["status"] == "OK"
+
+
+@respx.mock
+async def test_vworld_health_param_error_reported(fake_keys):
+    body = {"response": {"status": "ERROR", "error": {"code": "PARAM_REQUIRED", "text": "필수 파라미터인 category가 없어서 요청을 처리할수 없습니다."}}}
+    respx.get(vworld.SEARCH_API_URL).mock(return_value=httpx.Response(200, json=body))
+    res = await vworld._vworld_health()
+    assert res["status"] == "ERROR"
+    assert res["message"].startswith("VWorld Error [PARAM_REQUIRED]")
