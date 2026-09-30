@@ -195,3 +195,30 @@ async def test_service_key_sent_decoded_once(monkeypatch):
 async def test_region_errors(fake_keys, bad):
     res = await rtms.rtms_search_land_transactions(months_back=1, **bad)
     assert res["status"] == "ERROR"
+
+
+@respx.mock
+async def test_all_months_failing_is_error_not_no_data(fake_keys):
+    """Every month blocked/failing must surface as ERROR, not as '거래 0건'."""
+    route = respx.get(LAND_URL).mock(return_value=httpx.Response(403))
+    res = await rtms.rtms_search_land_transactions("강남구", "역삼동", months_back=3)
+    assert res["status"] == "ERROR"
+    assert "All 3 monthly requests" in res["message"]
+    assert "403" in res["message"]
+    assert route.call_count == 3  # 4xx 는 재시도하지 않음
+    assert fake_keys["molit"] not in res["message"]
+
+
+@respx.mock
+async def test_all_months_api_error_code_is_error(fake_keys):
+    respx.get(LAND_URL).mock(return_value=httpx.Response(200, text=fx.rtms_xml([], result_code="99")))
+    res = await rtms.rtms_search_land_transactions(pnu=fx.PNU, months_back=2)
+    assert res["status"] == "ERROR"
+    assert "API returned error [99]" in res["message"]
+
+
+@respx.mock
+async def test_all_months_empty_is_still_no_data(fake_keys):
+    respx.get(LAND_URL).mock(return_value=httpx.Response(200, text=fx.rtms_xml([])))
+    res = await rtms.rtms_search_land_transactions(pnu=fx.PNU, months_back=2)
+    assert res["status"] == "NO_DATA"

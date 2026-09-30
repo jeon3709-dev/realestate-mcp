@@ -297,8 +297,13 @@ async def _fetch_month(
     lawd_cd: str,
     ymd: str,
 ) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
-    """Fetch every page of one contract month. Returns (status, items, auth_error_message)."""
+    """Fetch every page of one contract month.
+
+    Returns (status, items, error_message). status: OK / FAILED(month aborted by an
+    HTTP·API·parsing error; items fetched so far are kept) / AUTH_ERROR.
+    """
     month_items_all: List[Dict[str, Any]] = []
+    failure: Optional[str] = None
     async with semaphore:
         page = 1
         while True:
@@ -330,6 +335,7 @@ async def _fetch_month(
 
                 if result_code != "000" and result_code != "00":
                     logger.error(f"API returned error [{result_code}]: {result_msg} for month {ymd}")
+                    failure = f"API returned error [{result_code}]: {result_msg}"
                     break
 
                 body = res_node.get("body", {})
@@ -360,11 +366,15 @@ async def _fetch_month(
 
             except httpx.HTTPError as e:
                 logger.error(f"HTTP Network error on {ymd} page {page}: {sanitize_error(str(e))}")
+                failure = f"HTTP/network error: {sanitize_error(str(e))}"
                 break
             except Exception as e:
                 logger.error(f"Unexpected parsing error on {ymd} page {page}: {sanitize_error(str(e))}")
+                failure = f"Unexpected parsing error: {sanitize_error(str(e))}"
                 break
 
+    if failure:
+        return "FAILED", month_items_all, failure
     return "OK", month_items_all, None
 
 
@@ -394,10 +404,22 @@ async def fetch_api_data(
             for ymd in months
         ])
 
-    for status, month_items, err_msg in results:
+    failed: List[Tuple[str, str]] = []
+    for ymd, (status, month_items, err_msg) in zip(months, results):
         if status == "AUTH_ERROR":
             return "AUTH_ERROR", [{"error": f"OpenAPI Authentication Failure: {err_msg}"}]
+        if status == "FAILED":
+            failed.append((ymd, err_msg or "unknown error"))
         all_items.extend(month_items)
+
+    # 원본은 월별 오류를 로그만 남기고 건너뛰어, 모든 월이 실패해도 "거래 0건(NO_DATA)"으로
+    # 보고됐다. 모든 월이 실패했고 수집된 거래가 없으면 오류로 반환한다.
+    # (일부 월만 실패한 경우는 원본과 같이 성공한 월의 결과를 반환한다.)
+    if months and len(failed) == len(months) and not all_items:
+        return "ERROR", [{
+            "error": f"All {len(months)} monthly requests to {endpoint_name} failed "
+                     f"(e.g. {failed[0][0]}: {failed[0][1]}). Check network access to apis.data.go.kr."
+        }]
 
     return "OK", all_items
 
