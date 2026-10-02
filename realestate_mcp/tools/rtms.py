@@ -217,8 +217,11 @@ class RegionQuery:
 
     def matches(self, umd: str) -> bool:
         if self.matched_dongs is not None:
-            # Original behaviour: exact membership in resolved legal dong names
-            return umd in self.matched_dongs
+            # 원본: 법정동명 정확 일치. 단, 읍·면 지역은 umdNm 이 "양평읍 백안리"처럼
+            # "읍면명 리명" 형태로 와서 원본 필터로는 항상 0건이었다(2026-09-30 실호출:
+            # 양평군 양평읍 정확 일치 12개월 0건, 시군구 전체 조회 시 "양평읍 백안리 …" 확인).
+            # 그래서 "<읍면명> " 으로 시작하는 umdNm 도 해당 읍면으로 인정한다.
+            return umd in self.matched_dongs or any(umd.startswith(d + " ") for d in self.matched_dongs)
         if not self.dong_filter:
             return True  # 시군구 전체
         return dong_name_matches(umd, self.dong_filter)

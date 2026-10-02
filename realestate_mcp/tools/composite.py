@@ -58,6 +58,7 @@ RECAP_FIELDS = ("platArea", "archArea", "totArea", "bcRat", "vlRat", "mainPurpsC
 TITLE_FIELDS = (
     "bldNm", "dongNm", "grndFlrCnt", "ugrndFlrCnt", "mainPurpsCdNm", "strctCdNm",
     "platArea", "archArea", "totArea", "bcRat", "vlRat", "rserthqkDsgnApplyYn", "rserthqkAblty",
+    "useAprDay",  # 사용승인일: docstring 에는 없으나 2026-09-30 실응답(getBrTitleInfo)으로 확인
 )
 JIJIGU_FIELDS = ("jijiguCdNm", "jijiguGbCdNm", "reprYn")
 
@@ -85,6 +86,18 @@ def _to_float(val: Any) -> Optional[float]:
 def _to_int(val: Any) -> Optional[int]:
     f = _to_float(val)
     return int(f) if f is not None else None
+
+
+def _fmt_yyyymmdd(val: Any) -> Optional[str]:
+    """'19920117' → '1992-01-17'. 빈 값(공백 포함)은 None, 형식이 다르면 원문 그대로."""
+    if val is None:
+        return None
+    text = str(val).strip()
+    if not text:
+        return None
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text
 
 
 def _m2_to_pyung(m2: Optional[float]) -> Optional[float]:
@@ -422,6 +435,7 @@ def _build_summary(sections: Dict[str, Any], tx_types: List[str]) -> Dict[str, A
         "floor_area_ratio": _to_float(basis_rec.get("vlRat")) if basis_rec else None,
         "ground_floors": _to_int(single_title.get("grndFlrCnt")) if single_title else None,
         "underground_floors": _to_int(single_title.get("ugrndFlrCnt")) if single_title else None,
+        "use_approval_date": _fmt_yyyymmdd(single_title.get("useAprDay")) if single_title else None,
         "building_count": _to_int(bdata["recap_title"][0].get("mainBldCnt")) if bdata.get("recap_title") else None,
         "building_basis": basis_label,
         "transactions": tx_summary,
@@ -473,6 +487,8 @@ def _render_markdown(result: Dict[str, Any], indicators: Dict[str, Any]) -> str:
     md += f"| 건폐율 / 용적률 | {val(indicators['building_coverage_ratio'], '%')} / {val(indicators['floor_area_ratio'], '%')} | {basis}(bcRat/vlRat) |\n"
     md += (f"| 층수(지상/지하) | {val(indicators['ground_floors'], '층')} / {val(indicators['underground_floors'], '층')} "
            "| 건축물대장 표제부(단일 동일 때만) |\n")
+    md += (f"| 사용승인일 | {val(indicators['use_approval_date'])} "
+           "| 건축물대장 표제부(단일 동일 때만, useAprDay) |\n")
     md += f"| 동 수(주건축물) | {val(indicators['building_count'], '동')} | 건축물대장 총괄표제부(mainBldCnt) |\n"
     for t, item in indicators["transactions"].items():
         label = TX_CONFIG[t]["label"]
@@ -502,8 +518,7 @@ def _render_markdown(result: Dict[str, Any], indicators: Dict[str, Any]) -> str:
         md += "\n" + "\n".join(blocks)
 
     if parcel.get("legal_dong") and parcel["legal_dong"].get("ri"):
-        md += ("\n> ⚠️ 리(里) 단위 필지: 실거래가 법정동 필터를 읍·면 명칭으로 적용함. 읍·면 지역의 실거래 응답 "
-               "umdNm 형식이 확인되지 않아 거래가 누락될 수 있음(0건이면 rtms_* 도구로 시군구 전체 조회 권장)\n")
+        md += "\n> ℹ️ 리(里) 단위 필지: 인근 실거래는 '읍·면 + 리' 단위(umdNm)로 필터링함\n"
     md += f"\n> ⚠️ {DISCLAIMER}\n"
     return md
 
@@ -589,7 +604,10 @@ async def site_profile(
             bdong_note = f"법정동코드 {parts.bdong_cd} 를 code_bdong.json 에서 찾지 못해 실거래가는 시군구 전체 기준으로 조회"
     except Exception as e:
         bdong_note = f"법정동코드 DB 조회 실패({sanitize_error(str(e))}); 실거래가는 시군구 전체 기준으로 조회"
-    dong_name = bdong.get("dong") if bdong else None
+    # 실거래 법정동 필터: 동 지역은 읍면동명, 리 지역은 "읍면명 리명" (umdNm 표기와 동일)
+    dong_name: Optional[str] = None
+    if bdong and bdong.get("dong"):
+        dong_name = f"{bdong['dong']} {bdong['ri']}" if bdong.get("ri") else bdong["dong"]
 
     tx_types: List[str] = []
     for t in transaction_types or []:
@@ -697,7 +715,7 @@ async def site_profile(
     if include_building:
         sources["building"] = {
             "apis": ["건축HUB 건축물대장정보 서비스 (getBrRecapTitleInfo, getBrTitleInfo, getBrJijiguInfo)"],
-            "reference_date": None,  # TODO: 대장 기준일자(crtnDay 등) 실응답 미확인
+            "reference_date": None,  # crtnDay(생성일자)는 실응답에 있으나 "기준일자"인지 공식 정의 미확인 → null 유지
             "queried_at": queried_at,
         }
     if include_transactions and tx_types:
